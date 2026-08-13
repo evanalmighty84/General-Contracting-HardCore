@@ -410,11 +410,26 @@ function guessCity(location = "") {
         "north richland hills",
         "lowry crossing",
         "melissa",
+
+        // Arlington / Grand Prairie / Mid-Cities area
+        "grand prairie",
+        "pantego",
+        "dalworthington gardens",
+        "euless",
+        "bedford",
+        "hurst",
+        "irving",
+        "richland hills",
+        "colleyville",
+        "haltom city",
+        "kennedale",
+        "mansfield",
     ];
 
     const direct = knownCities.find((city) => lower.includes(city));
 
     if (direct) return direct;
+
     if (lower.includes("craig ranch")) return "mckinney";
     if (lower.includes("eldorado")) return "mckinney";
     if (lower.includes("trinity falls")) return "mckinney";
@@ -1075,7 +1090,10 @@ async function searchNextdoor(page, query) {
     }
 }
 
-async function collectPostLinks(page, limit = MAX_POSTS_PER_TERM) {
+async function collectPostLinks(
+    page,
+    limit = MAX_POSTS_PER_TERM,
+) {
     console.log("⬇️ Loading search results...");
 
     let previousCount = -1;
@@ -1103,35 +1121,142 @@ async function collectPostLinks(page, limit = MAX_POSTS_PER_TERM) {
         const results = [];
         const seen = new Set();
 
-        for (const anchor of document.querySelectorAll(
+        const clean = (value = "") =>
+            String(value).replace(/\s+/g, " ").trim();
+
+        const anchors = document.querySelectorAll(
             'a[href*="/p/"], a[href*="/posting/"]',
-        )) {
+        );
+
+        for (const anchor of anchors) {
             const href = anchor.href;
 
-            if (!href || seen.has(href)) continue;
+            if (!href || seen.has(href)) {
+                continue;
+            }
 
-            const root =
-                anchor.closest("article, [role=article], li") ||
-                anchor.parentElement;
+            /*
+             * IMPORTANT:
+             *
+             * A Nextdoor search result can contain additional <a> tags
+             * pointing to the SAME post for comments/recommendations.
+             *
+             * The primary/original search-result card has:
+             *
+             *   data-testid="search-result-image"
+             *
+             * Comments do not.
+             *
+             * Only accept the primary result card here.
+             */
+            const primaryAvatar = anchor.querySelector(
+                '[data-testid="search-result-image"]',
+            );
 
-            const preview = (
-                root?.innerText ||
-                anchor.innerText ||
-                ""
-            )
-                .replace(/\s+/g, " ")
-                .trim();
+            if (!primaryAvatar) {
+                continue;
+            }
 
-            if (preview.length < 15) continue;
+            // ---------------------------------------------------------
+            // AUTHOR
+            // ---------------------------------------------------------
+
+            let author = null;
+
+            const avatarLabel =
+                primaryAvatar.getAttribute("aria-label") || "";
+
+            const avatarMatch =
+                avatarLabel.match(/^Avatar for\s+(.+)$/i);
+
+            if (avatarMatch) {
+                author = clean(avatarMatch[1]);
+            }
+
+            // ---------------------------------------------------------
+            // LOCATION
+            // ---------------------------------------------------------
+            //
+            // Search cards currently contain text like:
+            //
+            // Arlington, TX · 22 hr ago
+            //
+            // We specifically find that city/state pattern instead of
+            // blindly taking arbitrary styled text.
+            // ---------------------------------------------------------
+
+            let location = null;
+
+            const styledTexts = [
+                ...anchor.querySelectorAll(
+                    '[data-testid="styled-text"]',
+                ),
+            ]
+                .map((element) => clean(element.textContent))
+                .filter(Boolean);
+
+            for (const text of styledTexts) {
+                const match = text.match(
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*/i,
+                );
+
+                if (match) {
+                    location =
+                        `${clean(match[1])}, ${match[2].toUpperCase()}`;
+                    break;
+                }
+            }
+
+            // ---------------------------------------------------------
+            // PREVIEW
+            // ---------------------------------------------------------
+
+            let preview = "";
+
+            const bodyWrappers = [
+                ...anchor.querySelectorAll(
+                    '[data-testid="styled-text-wrapper"]',
+                ),
+            ];
+
+            /*
+             * Look for the longest text wrapper. The post body tends to
+             * be substantially longer than author/location/count fields.
+             */
+            for (const wrapper of bodyWrappers) {
+                const text = clean(wrapper.textContent);
+
+                if (
+                    text.length > preview.length &&
+                    text !== author &&
+                    !/^.+,\s*[A-Z]{2}\s*·/i.test(text)
+                ) {
+                    preview = text;
+                }
+            }
+
+            if (preview.length < 15) {
+                preview = clean(anchor.innerText);
+            }
+
+            if (preview.length < 15) {
+                continue;
+            }
 
             seen.add(href);
 
             results.push({
                 url: href,
                 preview: preview.slice(0, 1_500),
+
+                // NEW — authoritative search-result metadata
+                author: author || null,
+                location: location || null,
             });
 
-            if (results.length >= maxResults) break;
+            if (results.length >= maxResults) {
+                break;
+            }
         }
 
         return results;
@@ -1151,6 +1276,14 @@ async function collectPostLinks(page, limit = MAX_POSTS_PER_TERM) {
     const posts = [...unique.values()];
 
     console.log(`🔗 Found ${posts.length} unique posts.`);
+
+    for (const post of posts) {
+        console.log(
+            `   📍 ${post.author || "(unknown author)"} → ` +
+            `${post.location || "(unknown location)"}`,
+        );
+    }
+
     return posts;
 }
 
@@ -1252,7 +1385,9 @@ async function extractPostDetails(detailPage, post, searchTerm) {
     await sleep(1_400);
     await expandSeeMore(detailPage);
 
-    const author = await extractAuthor(detailPage);
+    const author =
+        post.author ||
+        await extractAuthor(detailPage);
 
     const extracted = await detailPage.evaluate(
         ({ preview }) => {
@@ -1362,7 +1497,9 @@ async function extractPostDetails(detailPage, post, searchTerm) {
     );
 
     const location = cleanText(
-        extracted.location || "",
+        post.location ||
+        extracted.location ||
+        "",
     );
 
     const cityState = await resolveCityState({
