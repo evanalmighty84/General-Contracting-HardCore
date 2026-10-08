@@ -1,5 +1,7 @@
 # Railway Multilogin Lights Cron
 
+<!-- Deployment trigger: 2026-10-08. No functional code change. -->
+
 This package starts a Multilogin profile, connects Playwright over CDP, searches Nextdoor for `lights`, and writes results to `unfiltered_lights`.
 
 ## Railway variables
