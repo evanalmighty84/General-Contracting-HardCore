@@ -70,7 +70,7 @@ RUN npm install --omit=dev
 
 COPY . ./
 
-RUN sed -i 's/\r$//' /app/railway-entrypoint.sh \
-    && chmod +x /app/railway-entrypoint.sh
+RUN sed -i 's/\r$//' /app/railway-entrypoint.sh /app/arlington-start.sh \
+    && chmod +x /app/railway-entrypoint.sh /app/arlington-start.sh
 
-ENTRYPOINT ["/app/railway-entrypoint.sh"]
+ENTRYPOINT ["/app/arlington-start.sh"]
