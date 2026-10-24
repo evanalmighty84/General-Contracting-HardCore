@@ -21,6 +21,16 @@ const CRM_API_BASE_URL =
     process.env.CRM_API_BASE_URL ||
     "http://ftn-enrichment.railway.internal:8080";
 
+const NEXTDOOR_QUEUE_API_BASE_URL =
+    process.env.NEXTDOOR_QUEUE_API_BASE_URL ||
+    "https://crm-function-app-5d4de511071d.herokuapp.com/server/lead_function/api/nextdoor";
+
+const NEXTDOOR_QUEUE_SCRAPER_KEY =
+    "general_contracting_hardcore";
+
+const NEXTDOOR_QUEUE_SCRAPER_NAME =
+    "Arlington General Contractor Hardcore Scraper";
+
 const MAX_POSTS_PER_TERM = Number(
     process.env.GENERAL_CONTRACTING_MAX_POSTS || 50,
 );
@@ -173,6 +183,216 @@ function getErrorMessage(error) {
     return error?.message || String(error || "Unknown error");
 }
 
+function shuffleArray(items) {
+    const shuffled = [...items];
+
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [shuffled[index], shuffled[swapIndex]] = [
+            shuffled[swapIndex],
+            shuffled[index],
+        ];
+    }
+
+    return shuffled;
+}
+
+function parseNextdoorThrottleMessage(text = "") {
+    const match = String(text).match(
+        /Throttled,\s*wait\s*(\d+)\s*seconds\.?/i,
+    );
+
+    if (!match) return null;
+
+    return {
+        waitSeconds: Number(match[1]),
+        message: match[0],
+    };
+}
+
+function isNextdoorThrottleError(error) {
+    return /^NEXTDOOR_THROTTLED:/i.test(getErrorMessage(error));
+}
+
+async function detectNextdoorThrottle(page) {
+    const bodyText = await page
+        .locator("body")
+        .innerText()
+        .catch(() => "");
+
+    return parseNextdoorThrottleMessage(bodyText);
+}
+
+function nextdoorQueueEndpoint(pathname) {
+    return NEXTDOOR_QUEUE_API_BASE_URL.replace(/\/$/, "") + pathname;
+}
+
+async function fetchCarryoverSearchTerms() {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) {
+        console.log("ℹ️ Nextdoor queue API is not configured; continuing without carryover terms.");
+        return [];
+    }
+
+    const endpointUrl = nextdoorQueueEndpoint(
+        `/search-queue/${encodeURIComponent(NEXTDOOR_QUEUE_SCRAPER_KEY)}`,
+    );
+
+    try {
+        console.log(`♻️ Loading unfinished Nextdoor search terms → ${endpointUrl}`);
+
+        const response = await fetch(endpointUrl, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(
+                Math.max(
+                    5000,
+                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
+                ),
+            ),
+        });
+
+        const responseText = await response.text();
+
+        if (!response.ok) {
+            throw new Error(
+                `Queue GET returned HTTP ${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        const body = responseText ? JSON.parse(responseText) : {};
+        const rawTerms = Array.isArray(body?.pending_terms)
+            ? body.pending_terms
+            : [];
+
+        const entries = [];
+        const seen = new Set();
+
+        for (const entry of rawTerms) {
+            const query = cleanText(
+                typeof entry === "string"
+                    ? entry
+                    : entry?.query || entry?.search_term || "",
+            );
+            const key = normalizeSearchTerm(query);
+
+            if (!query || !key || seen.has(key)) continue;
+
+            seen.add(key);
+            entries.push({
+                query,
+                source:
+                    typeof entry === "object" && entry?.source
+                        ? cleanText(entry.source)
+                        : "carryover",
+            });
+        }
+
+        console.log(`♻️ Loaded ${entries.length} unfinished hardcore GC term(s).`);
+        return entries;
+    } catch (error) {
+        console.warn(
+            "⚠️ Could not load hardcore GC carryover queue; continuing with the normal adaptive plan: " +
+            getErrorMessage(error),
+        );
+        return [];
+    }
+}
+
+async function saveThrottleCarryover({
+    runId,
+    throttledTerm,
+    waitSeconds,
+    remainingTerms,
+}) {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) return false;
+
+    const endpointUrl = nextdoorQueueEndpoint("/search-queue/throttled");
+
+    try {
+        const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                scraper_key: NEXTDOOR_QUEUE_SCRAPER_KEY,
+                scraper_name: NEXTDOOR_QUEUE_SCRAPER_NAME,
+                run_id: runId,
+                throttled_term: throttledTerm,
+                wait_seconds: waitSeconds || null,
+                remaining_terms: remainingTerms.map((entry) => ({
+                    query: entry.query,
+                    source: entry.source || "unknown",
+                })),
+            }),
+            signal: AbortSignal.timeout(
+                Math.max(
+                    5000,
+                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
+                ),
+            ),
+        });
+
+        const responseText = await response.text();
+        if (!response.ok) {
+            throw new Error(
+                `Queue POST returned HTTP ${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        console.log(
+            `♻️ Saved ${remainingTerms.length} unfinished hardcore GC term(s) to the backend carryover queue.`,
+        );
+        return true;
+    } catch (error) {
+        console.error(
+            "⚠️ Could not save hardcore GC carryover queue before exit: " +
+            getErrorMessage(error),
+        );
+        return false;
+    }
+}
+
+async function clearCarryoverSearchTerms(runId) {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) return false;
+
+    const endpointUrl = nextdoorQueueEndpoint("/search-queue/completed");
+
+    try {
+        const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                scraper_key: NEXTDOOR_QUEUE_SCRAPER_KEY,
+                run_id: runId,
+            }),
+            signal: AbortSignal.timeout(
+                Math.max(
+                    5000,
+                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
+                ),
+            ),
+        });
+
+        const responseText = await response.text();
+        if (!response.ok) {
+            throw new Error(
+                `Queue completion POST returned HTTP ${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        console.log("✅ Cleared hardcore GC carryover queue after full search completion.");
+        return true;
+    } catch (error) {
+        console.warn(
+            "⚠️ Could not clear hardcore GC carryover queue: " +
+            getErrorMessage(error),
+        );
+        return false;
+    }
+}
+
 function isTargetCrashError(error) {
     return TARGET_CRASH_PATTERN.test(getErrorMessage(error));
 }
@@ -229,6 +449,16 @@ async function configurePage(page, label) {
                 `ℹ️ Suppressed ${suppressedPageErrors} harmless ` +
                 `network/ad page error(s) for ${label}.`,
             );
+        }
+    });
+
+    page.on("response", (response) => {
+        if (response.status() !== 429) return;
+
+        const responseUrl = response.url();
+
+        if (/nextdoor\.com/i.test(responseUrl)) {
+            console.error(`🌐 HTTP 429 (${label}): ${responseUrl}`);
         }
     });
 
@@ -1088,6 +1318,19 @@ async function searchNextdoor(page, query) {
         await applyDistanceFilter(page, 15);
         await applyTodayFilter(page);
         await sleep(1_800);
+    }
+
+    const throttle = await detectNextdoorThrottle(page);
+
+    if (throttle) {
+        console.error(
+            `⛔ Nextdoor throttled search for "${query}". ` +
+            `Requested wait: ${throttle.waitSeconds} seconds.`,
+        );
+
+        throw new Error(
+            `NEXTDOOR_THROTTLED:${throttle.waitSeconds}:${query}`,
+        );
     }
 }
 
@@ -2310,6 +2553,10 @@ async function collectPostsForSearchTerm(context, query) {
                 );
             }
 
+            if (isNextdoorThrottleError(error)) {
+                throw error;
+            }
+
             console.error(
                 `❌ Search attempt ${attempt}/` +
                 `${SEARCH_PAGE_MAX_ATTEMPTS} failed for "${query}": ` +
@@ -2774,9 +3021,54 @@ async function main() {
 
         const strategy = await buildAdaptiveSearchPlan();
 
-        await createSearchRun(runId, strategy);
+        const carryoverTerms =
+            await fetchCarryoverSearchTerms();
+
+        const carryoverKeys = new Set(
+            carryoverTerms.map((entry) =>
+                normalizeSearchTerm(entry.query),
+            ),
+        );
+
+        const normalTerms = strategy.plan.filter(
+            (entry) =>
+                !carryoverKeys.has(
+                    normalizeSearchTerm(entry.query),
+                ),
+        );
+
+        const randomizedCarryover =
+            shuffleArray(carryoverTerms);
+
+        const randomizedNormal =
+            shuffleArray(normalTerms);
+
+        const executionPlan = [
+            ...randomizedCarryover,
+            ...randomizedNormal,
+        ];
+
+        const runStrategy = {
+            ...strategy,
+            plan: executionPlan,
+        };
+
+        await createSearchRun(runId, runStrategy);
 
         console.log(`🆔 GC search run: ${runId}`);
+        console.log(
+            `♻️ Carryover terms prioritized: ${randomizedCarryover.length}`,
+        );
+        console.log(
+            `🔀 Normal adaptive terms randomized after carryover: ${randomizedNormal.length}`,
+        );
+        console.log(
+            `📋 Final hardcore GC execution plan: ${executionPlan.length} term(s).`,
+        );
+        console.log(
+            "🔀 Search order this run:",
+            executionPlan.map((entry) => entry.query),
+        );
 
         browser = await chromium.connectOverCDP(
             process.env.MULTILOGIN_WS,
@@ -2812,10 +3104,10 @@ async function main() {
 
         for (
             let termIndex = 0;
-            termIndex < strategy.plan.length;
+            termIndex < executionPlan.length;
             termIndex += 1
         ) {
-            const entry = strategy.plan[termIndex];
+            const entry = executionPlan[termIndex];
             const query = entry.query;
             const termSource = entry.source;
 
@@ -2831,7 +3123,7 @@ async function main() {
             console.log("");
             console.log("############################################################");
             console.log(
-                `🔎 SEARCH ${termIndex + 1}/${strategy.plan.length}: ` +
+                `🔎 SEARCH ${termIndex + 1}/${executionPlan.length}: ` +
                 `"${query}" [${termSource}]`,
             );
             printTermHistory(query, strategy.performanceByTerm);
@@ -2864,6 +3156,36 @@ async function main() {
                     throw error;
                 }
 
+                if (isNextdoorThrottleError(error)) {
+                    const message = getErrorMessage(error);
+                    const parts = message.split(":");
+                    const waitSeconds = Number(parts[1] || 0);
+                    const remainingTerms =
+                        executionPlan.slice(termIndex);
+
+                    console.error(
+                        "⛔ Nextdoor throttle detected. " +
+                        "Saving the unfinished hardcore GC terms " +
+                        "before stopping this run.",
+                    );
+
+                    if (waitSeconds > 0) {
+                        console.error(
+                            `⏳ Nextdoor requested a cooldown of approximately ` +
+                            `${waitSeconds} seconds.`,
+                        );
+                    }
+
+                    await saveThrottleCarryover({
+                        runId,
+                        throttledTerm: query,
+                        waitSeconds,
+                        remainingTerms,
+                    });
+
+                    throw error;
+                }
+
                 console.error(
                     `⏭️ Skipping search term "${query}" after ` +
                     `fresh-page retries: ${getErrorMessage(error)}`,
@@ -2881,7 +3203,7 @@ async function main() {
         );
         console.log("✅ Adaptive general contracting scrape finished.");
         console.log(`   Run ID: ${runId}`);
-        console.log(`   Search terms: ${strategy.plan.length}`);
+        console.log(`   Search terms: ${executionPlan.length}`);
         console.log(
             `   Result observations logged: ${totals.resultObservations}`,
         );
@@ -2908,6 +3230,8 @@ async function main() {
         await finishSearchRun(runId, "completed", totals);
         searchRunFinalized = true;
 
+        await clearCarryoverSearchTerms(runId);
+
         // The FTN pipeline is unchanged: the scraper still asks the internal
         // FTN service to run pre_enrichment first, then FamilyTreeNow.
         await triggerFtnEnrichment({
@@ -2925,7 +3249,9 @@ async function main() {
         if (!searchRunFinalized) {
             await finishSearchRun(
                 runId,
-                "failed",
+                isNextdoorThrottleError(error)
+                    ? "throttled"
+                    : "failed",
                 totals,
                 getErrorMessage(error),
             ).catch((finishError) => {
