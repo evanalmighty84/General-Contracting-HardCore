@@ -452,6 +452,16 @@ async function configurePage(page, label) {
         }
     });
 
+    page.on("response", (response) => {
+        if (response.status() !== 429) return;
+
+        const responseUrl = response.url();
+
+        if (/nextdoor\.com/i.test(responseUrl)) {
+            console.error(`🌐 HTTP 429 (${label}): ${responseUrl}`);
+        }
+    });
+
     await page.route("**/*", async (route) => {
         const request = route.request();
         const resourceType = request.resourceType();
@@ -1308,6 +1318,19 @@ async function searchNextdoor(page, query) {
         await applyDistanceFilter(page, 15);
         await applyTodayFilter(page);
         await sleep(1_800);
+    }
+
+    const throttle = await detectNextdoorThrottle(page);
+
+    if (throttle) {
+        console.error(
+            `⛔ Nextdoor throttled search for "${query}". ` +
+            `Requested wait: ${throttle.waitSeconds} seconds.`,
+        );
+
+        throw new Error(
+            `NEXTDOOR_THROTTLED:${throttle.waitSeconds}:${query}`,
+        );
     }
 }
 
@@ -2528,6 +2551,10 @@ async function collectPostsForSearchTerm(context, query) {
                     `BROWSER_DISCONNECTED while searching for "${query}": ` +
                     getErrorMessage(error),
                 );
+            }
+
+            if (isNextdoorThrottleError(error)) {
+                throw error;
             }
 
             console.error(
