@@ -3021,9 +3021,54 @@ async function main() {
 
         const strategy = await buildAdaptiveSearchPlan();
 
-        await createSearchRun(runId, strategy);
+        const carryoverTerms =
+            await fetchCarryoverSearchTerms();
+
+        const carryoverKeys = new Set(
+            carryoverTerms.map((entry) =>
+                normalizeSearchTerm(entry.query),
+            ),
+        );
+
+        const normalTerms = strategy.plan.filter(
+            (entry) =>
+                !carryoverKeys.has(
+                    normalizeSearchTerm(entry.query),
+                ),
+        );
+
+        const randomizedCarryover =
+            shuffleArray(carryoverTerms);
+
+        const randomizedNormal =
+            shuffleArray(normalTerms);
+
+        const executionPlan = [
+            ...randomizedCarryover,
+            ...randomizedNormal,
+        ];
+
+        const runStrategy = {
+            ...strategy,
+            plan: executionPlan,
+        };
+
+        await createSearchRun(runId, runStrategy);
 
         console.log(`🆔 GC search run: ${runId}`);
+        console.log(
+            `♻️ Carryover terms prioritized: ${randomizedCarryover.length}`,
+        );
+        console.log(
+            `🔀 Normal adaptive terms randomized after carryover: ${randomizedNormal.length}`,
+        );
+        console.log(
+            `📋 Final hardcore GC execution plan: ${executionPlan.length} term(s).`,
+        );
+        console.log(
+            "🔀 Search order this run:",
+            executionPlan.map((entry) => entry.query),
+        );
 
         browser = await chromium.connectOverCDP(
             process.env.MULTILOGIN_WS,
@@ -3059,10 +3104,10 @@ async function main() {
 
         for (
             let termIndex = 0;
-            termIndex < strategy.plan.length;
+            termIndex < executionPlan.length;
             termIndex += 1
         ) {
-            const entry = strategy.plan[termIndex];
+            const entry = executionPlan[termIndex];
             const query = entry.query;
             const termSource = entry.source;
 
@@ -3078,7 +3123,7 @@ async function main() {
             console.log("");
             console.log("############################################################");
             console.log(
-                `🔎 SEARCH ${termIndex + 1}/${strategy.plan.length}: ` +
+                `🔎 SEARCH ${termIndex + 1}/${executionPlan.length}: ` +
                 `"${query}" [${termSource}]`,
             );
             printTermHistory(query, strategy.performanceByTerm);
@@ -3111,6 +3156,36 @@ async function main() {
                     throw error;
                 }
 
+                if (isNextdoorThrottleError(error)) {
+                    const message = getErrorMessage(error);
+                    const parts = message.split(":");
+                    const waitSeconds = Number(parts[1] || 0);
+                    const remainingTerms =
+                        executionPlan.slice(termIndex);
+
+                    console.error(
+                        "⛔ Nextdoor throttle detected. " +
+                        "Saving the unfinished hardcore GC terms " +
+                        "before stopping this run.",
+                    );
+
+                    if (waitSeconds > 0) {
+                        console.error(
+                            `⏳ Nextdoor requested a cooldown of approximately ` +
+                            `${waitSeconds} seconds.`,
+                        );
+                    }
+
+                    await saveThrottleCarryover({
+                        runId,
+                        throttledTerm: query,
+                        waitSeconds,
+                        remainingTerms,
+                    });
+
+                    throw error;
+                }
+
                 console.error(
                     `⏭️ Skipping search term "${query}" after ` +
                     `fresh-page retries: ${getErrorMessage(error)}`,
@@ -3128,7 +3203,7 @@ async function main() {
         );
         console.log("✅ Adaptive general contracting scrape finished.");
         console.log(`   Run ID: ${runId}`);
-        console.log(`   Search terms: ${strategy.plan.length}`);
+        console.log(`   Search terms: ${executionPlan.length}`);
         console.log(
             `   Result observations logged: ${totals.resultObservations}`,
         );
@@ -3155,6 +3230,8 @@ async function main() {
         await finishSearchRun(runId, "completed", totals);
         searchRunFinalized = true;
 
+        await clearCarryoverSearchTerms(runId);
+
         // The FTN pipeline is unchanged: the scraper still asks the internal
         // FTN service to run pre_enrichment first, then FamilyTreeNow.
         await triggerFtnEnrichment({
@@ -3172,7 +3249,9 @@ async function main() {
         if (!searchRunFinalized) {
             await finishSearchRun(
                 runId,
-                "failed",
+                isNextdoorThrottleError(error)
+                    ? "throttled"
+                    : "failed",
                 totals,
                 getErrorMessage(error),
             ).catch((finishError) => {
