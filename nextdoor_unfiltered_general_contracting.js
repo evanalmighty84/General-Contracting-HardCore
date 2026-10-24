@@ -21,6 +21,16 @@ const CRM_API_BASE_URL =
     process.env.CRM_API_BASE_URL ||
     "http://ftn-enrichment.railway.internal:8080";
 
+const NEXTDOOR_QUEUE_API_BASE_URL =
+    process.env.NEXTDOOR_QUEUE_API_BASE_URL ||
+    "https://crm-function-app-5d4de511071d.herokuapp.com/server/lead_function/api/nextdoor";
+
+const NEXTDOOR_QUEUE_SCRAPER_KEY =
+    "general_contracting_hardcore";
+
+const NEXTDOOR_QUEUE_SCRAPER_NAME =
+    "Arlington General Contractor Hardcore Scraper";
+
 const MAX_POSTS_PER_TERM = Number(
     process.env.GENERAL_CONTRACTING_MAX_POSTS || 50,
 );
