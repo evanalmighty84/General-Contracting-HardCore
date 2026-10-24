@@ -1531,6 +1531,82 @@ async function collectPostLinks(
     return posts;
 }
 
+const OTHER_LEAD_TABLE =
+    "unfiltered_ins_mold_pest_housecl_plumb_paint_land_lawn_handy";
+
+function normalizeDuplicateText(value) {
+    return cleanText(value || "")
+        .toLowerCase()
+        .replace(/[“”"‘’']/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function descriptionsLookLikeSamePost(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    if (!a || !b) {
+        return false;
+    }
+
+    if (a === b) {
+        return true;
+    }
+
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+
+    // Handles edited posts where the newer version merely appends an
+    // update, while avoiding very short generic snippets.
+    if (shorter.length >= 30 && longer.includes(shorter)) {
+        return true;
+    }
+
+    const tokensA = new Set(
+        a.split(" ").filter((token) => token.length >= 3),
+    );
+    const tokensB = new Set(
+        b.split(" ").filter((token) => token.length >= 3),
+    );
+
+    if (!tokensA.size || !tokensB.size) {
+        return false;
+    }
+
+    let overlap = 0;
+
+    for (const token of tokensA) {
+        if (tokensB.has(token)) {
+            overlap += 1;
+        }
+    }
+
+    const smallerTokenCount = Math.min(
+        tokensA.size,
+        tokensB.size,
+    );
+
+    return (
+        smallerTokenCount >= 5 &&
+        overlap / smallerTokenCount >= 0.82
+    );
+}
+
+function authorsCompatibleForDuplicate(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    // The search card occasionally has no author. In that case the
+    // same URL + strong description match is still enough evidence.
+    if (!a || !b) {
+        return true;
+    }
+
+    return a === b;
+}
+
 async function getExistingUrls(posts) {
     const urls = posts.map((post) => normalizePostUrl(post.url));
 
@@ -1538,16 +1614,97 @@ async function getExistingUrls(posts) {
 
     const { rows } = await pool.query(
         `
-            SELECT post_url
+            SELECT
+                post_url,
+                author,
+                description,
+                'current'::text AS source
             FROM ${TABLE_NAME}
+            WHERE post_url = ANY($1::text[])
+
+            UNION ALL
+
+            SELECT
+                post_url,
+                author,
+                description,
+                'other'::text AS source
+            FROM ${OTHER_LEAD_TABLE}
             WHERE post_url = ANY($1::text[])
         `,
         [urls],
     );
 
-    return new Set(
-        rows.map((row) => normalizePostUrl(row.post_url)),
-    );
+    const postsByUrl = new Map();
+
+    for (const post of posts) {
+        const url = normalizePostUrl(post.url);
+
+        if (!postsByUrl.has(url)) {
+            postsByUrl.set(url, []);
+        }
+
+        postsByUrl.get(url).push(post);
+    }
+
+    const existingUrls = new Set();
+    let crossTableMatches = 0;
+    let reusedUrlMismatches = 0;
+
+    for (const row of rows) {
+        const url = normalizePostUrl(row.post_url);
+
+        /*
+         * This table has a post_url conflict constraint. Any URL already
+         * present here is occupied regardless of content; skipping it is
+         * safer than allowing a reused/misaligned URL to overwrite the
+         * existing row through ON CONFLICT.
+         */
+        if (row.source === "current") {
+            existingUrls.add(url);
+            continue;
+        }
+
+        const candidates = postsByUrl.get(url) || [];
+
+        const samePost = candidates.some((post) =>
+            authorsCompatibleForDuplicate(
+                row.author,
+                post.author,
+            ) &&
+            descriptionsLookLikeSamePost(
+                row.description,
+                post.preview,
+            )
+        );
+
+        if (samePost) {
+            existingUrls.add(url);
+            crossTableMatches += 1;
+        } else {
+            /*
+             * We have historical evidence that Nextdoor URLs can appear
+             * with materially different content. Do not suppress a new
+             * candidate solely because another table contains the URL.
+             */
+            reusedUrlMismatches += 1;
+        }
+    }
+
+    if (crossTableMatches > 0) {
+        console.log(
+            `🧱 Cross-table historical duplicate matches: ${crossTableMatches}.`,
+        );
+    }
+
+    if (reusedUrlMismatches > 0) {
+        console.warn(
+            `⚠️ Reused/mismatched Nextdoor URL(s) not treated as duplicates: ` +
+            `${reusedUrlMismatches}.`,
+        );
+    }
+
+    return existingUrls;
 }
 
 async function expandSeeMore(page) {
