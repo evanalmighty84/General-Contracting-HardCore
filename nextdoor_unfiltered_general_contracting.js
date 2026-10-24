@@ -1167,21 +1167,30 @@ async function applyDistanceFilter(page, targetMiles = 15) {
     return false;
 }
 
-async function applyTodayFilter(page) {
-    console.log('🗓️ Applying "Today" date filter...');
+function getDateFilterForTermSource(termSource) {
+    return ["sonar", "fallback", "carryover"].includes(termSource)
+        ? "This Week"
+        : "Today";
+}
+
+function getDateFilterParam(targetLabel) {
+    return targetLabel === "This Week" ? "THIS_WEEK" : "TODAY";
+}
+
+async function applyDateFilter(page, targetLabel) {
+    console.log(`🗓️ Applying "${targetLabel}" date filter...`);
+
+    const anyDateLabel =
+        /^(All Time|Today|This Week|This Month|This Year)$/i;
+    const exactTarget = targetLabel === "This Week"
+        ? /^This Week$/i
+        : /^Today$/i;
 
     const triggerCandidates = [
-        page
-            .getByRole("button", {
-                name: /^(All Time|Today|This Week|This Month|This Year)$/i,
-            })
-            .first(),
+        page.getByRole("button", { name: anyDateLabel }).first(),
         page
             .locator("button, [role=button]")
-            .filter({
-                hasText:
-                    /^(All Time|Today|This Week|This Month|This Year)$/i,
-            })
+            .filter({ hasText: anyDateLabel })
             .first(),
     ];
 
@@ -1198,43 +1207,61 @@ async function applyTodayFilter(page) {
     }
 
     if (!trigger) {
-        console.log("ℹ️ Could not find the date filter.");
-        return false;
+        throw new Error("DATE_FILTER_NOT_FOUND:" + targetLabel);
     }
 
-    const currentText = cleanText(await trigger.innerText().catch(() => ""));
+    const before = cleanText(await trigger.innerText().catch(() => ""));
 
-    if (/^today$/i.test(currentText)) {
-        console.log('✅ Date was already set to "Today".');
-        return true;
-    }
+    if (!exactTarget.test(before)) {
+        await trigger.click();
+        await sleep(500);
 
-    await trigger.click();
-    await sleep(500);
+        const optionCandidates = [
+            page.getByRole("menuitem", { name: exactTarget }).first(),
+            page.getByRole("option", { name: exactTarget }).first(),
+            page.getByText(exactTarget).last(),
+        ];
 
-    const optionCandidates = [
-        page.getByRole("menuitem", { name: /^Today$/i }).first(),
-        page.getByRole("option", { name: /^Today$/i }).first(),
-        page.getByText(/^Today$/i).last(),
-    ];
+        let clicked = false;
 
-    for (const option of optionCandidates) {
-        if (
-            (await option.count().catch(() => 0)) &&
-            (await option.isVisible().catch(() => false))
-        ) {
-            await option.click();
-            await sleep(1_000);
-            console.log('✅ Applied "Today".');
-            return true;
+        for (const option of optionCandidates) {
+            if (
+                (await option.count().catch(() => 0)) &&
+                (await option.isVisible().catch(() => false))
+            ) {
+                await option.click();
+                clicked = true;
+                break;
+            }
         }
+
+        if (!clicked) {
+            throw new Error("DATE_FILTER_OPTION_NOT_FOUND:" + targetLabel);
+        }
+
+        await sleep(1_200);
     }
 
-    console.log('ℹ️ Could not find the "Today" option.');
-    return false;
-}
+    const verifyTrigger = page
+        .locator("button, [role=button]")
+        .filter({ hasText: anyDateLabel })
+        .first();
 
-async function applySearchFiltersByUrl(page, query) {
+    const after = cleanText(
+        await verifyTrigger.innerText().catch(() => ""),
+    );
+
+    if (!exactTarget.test(after)) {
+        throw new Error(
+            "DATE_FILTER_NOT_APPLIED: expected " + targetLabel +
+            ", saw \"" + (after || "unknown") + "\"",
+        );
+    }
+
+    console.log(`✅ Visible Nextdoor date filter verified: ${targetLabel}`);
+    return true;
+}
+async function applySearchFiltersByUrl(page, query, targetDateLabel) {
     const currentUrl = new URL(page.url());
 
     if (!/(^|\.)nextdoor\.com$/i.test(currentUrl.hostname)) {
@@ -1261,13 +1288,15 @@ async function applySearchFiltersByUrl(page, query) {
     );
     currentUrl.searchParams.set(
         "postDateFilter",
-        "TODAY",
+        getDateFilterParam(targetDateLabel),
     );
 
     const targetUrl = currentUrl.toString();
 
     console.log("🔗 Applying search filters through the URL:");
-    console.log("   Posts + Most Recent + 15 miles + Today");
+    console.log(
+        `   Posts + Most Recent + 15 miles + ${targetDateLabel}`,
+    );
     console.log(`   ${targetUrl}`);
 
     await page.goto(targetUrl, {
@@ -1301,7 +1330,7 @@ async function applySearchFiltersByUrl(page, query) {
         applied.postSortOrder === "SORT_BY_RECENCY" &&
         applied.postDistance === "15" &&
         applied.postDistanceUnit === "MILES" &&
-        applied.postDateFilter === "TODAY";
+        applied.postDateFilter === getDateFilterParam(targetDateLabel);
 
     if (!filtersAreCorrect) {
         throw new Error(
@@ -1310,7 +1339,7 @@ async function applySearchFiltersByUrl(page, query) {
     }
 }
 
-async function searchNextdoor(page, query) {
+async function searchNextdoor(page, query, targetDateLabel) {
     console.log("");
     console.log("============================================================");
     console.log(`🔍 Searching Nextdoor for "${query}"...`);
@@ -1351,26 +1380,25 @@ async function searchNextdoor(page, query) {
     await page.waitForLoadState("domcontentloaded").catch(() => {});
     await sleep(3_000);
 
-    // The normal search creates Nextdoor's current ssid/search parameters.
-    // Reuse that URL and append the exact filters first. If Nextdoor changes
-    // or strips those parameters, fall back to the visible Posts/filter controls.
+    // URL state alone is not trusted. We still navigate with the requested
+    // parameters, then physically click and verify the visible controls.
     try {
-        await applySearchFiltersByUrl(page, query);
+        await applySearchFiltersByUrl(page, query, targetDateLabel);
     } catch (error) {
-        console.warn(
-            `⚠️ URL filters failed: ${error.message}`,
-        );
-
-        console.log(
-            "♻️ Falling back to the visible Posts and filter controls...",
-        );
-
-        await goToPostsTab(page, query);
-        await applyMostRecentFilter(page);
-        await applyDistanceFilter(page, 15);
-        await applyTodayFilter(page);
-        await sleep(1_800);
+        console.warn(`⚠️ URL filter navigation failed: ${error.message}`);
     }
+
+    await goToPostsTab(page, query);
+    await applyMostRecentFilter(page);
+
+    const distanceApplied = await applyDistanceFilter(page, 15);
+
+    if (!distanceApplied) {
+        throw new Error("DISTANCE_FILTER_NOT_APPLIED:15 miles");
+    }
+
+    await applyDateFilter(page, targetDateLabel);
+    await sleep(1_800);
 
     const throttle = await detectNextdoorThrottle(page);
 
@@ -2728,7 +2756,7 @@ function printTermHistory(query, performanceByTerm) {
     );
 }
 
-async function collectPostsForSearchTerm(context, query) {
+async function collectPostsForSearchTerm(context, query, termSource) {
     let lastError = null;
 
     for (
@@ -2751,7 +2779,14 @@ async function collectPostsForSearchTerm(context, query) {
                 `search:${query}:attempt:${attempt}`,
             );
 
-            await searchNextdoor(searchPage, query);
+            const targetDateLabel =
+                getDateFilterForTermSource(termSource);
+
+            await searchNextdoor(
+                searchPage,
+                query,
+                targetDateLabel,
+            );
 
             const posts = await collectPostLinks(
                 searchPage,
@@ -2916,6 +2951,7 @@ async function processSearchTerm({
     const allPosts = await collectPostsForSearchTerm(
         context,
         query,
+        termSource,
     );
 
     const existingAll = await getExistingUrls(allPosts);
