@@ -588,6 +588,58 @@ function cleanText(value = "") {
     return String(value).replace(/\s+/g, " ").trim();
 }
 
+function parseNextdoorPostTimestamp(value, now = new Date()) {
+    const raw = cleanText(value);
+    if (!raw) return null;
+
+    const lower = raw.toLowerCase();
+    const date = new Date(now);
+
+    if (/^today$/i.test(raw)) return date.toISOString();
+
+    if (/^yesterday$/i.test(raw)) {
+        date.setDate(date.getDate() - 1);
+        return date.toISOString();
+    }
+
+    let match = lower.match(/^(\d+)\s*(?:min|mins|minute|minutes)\s*ago$/i);
+    if (match) {
+        date.setMinutes(date.getMinutes() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = lower.match(/^(\d+)\s*(?:hr|hrs|hour|hours)\s*ago$/i);
+    if (match) {
+        date.setHours(date.getHours() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = lower.match(/^(\d+)\s*(?:d|day|days)\s*(?:ago)?$/i);
+    if (match) {
+        date.setDate(date.getDate() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?$/);
+    if (match) {
+        const day = Number(match[1]);
+        const monthName = match[2];
+        let year = match[3] ? Number(match[3]) : now.getFullYear();
+        let parsed = new Date(monthName + " " + day + ", " + year + " 12:00:00");
+
+        if (Number.isNaN(parsed.getTime())) return null;
+
+        if (!match[3] && parsed.getTime() > now.getTime() + 7 * 86400000) {
+            year -= 1;
+            parsed = new Date(monthName + " " + day + ", " + year + " 12:00:00");
+        }
+
+        return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    }
+
+    return null;
+}
+
 function normalizePostUrl(url) {
     try {
         const parsed = new URL(url);
@@ -1430,6 +1482,7 @@ async function collectPostLinks(
             // ---------------------------------------------------------
 
             let location = null;
+            let postedAtText = null;
 
             const styledTexts = [
                 ...anchor.querySelectorAll(
@@ -1441,13 +1494,24 @@ async function collectPostLinks(
 
             for (const text of styledTexts) {
                 const match = text.match(
-                    /^(.+?),\s*([A-Z]{2})\s*·\s*/i,
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*([^·]+)(?:\s*·|$)/i,
                 );
 
                 if (match) {
                     location =
                         `${clean(match[1])}, ${match[2].toUpperCase()}`;
+                    postedAtText = clean(match[3]);
                     break;
+                }
+
+                const locationOnly = text.match(
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*/i,
+                );
+
+                if (locationOnly && !location) {
+                    location =
+                        `${clean(locationOnly[1])}, ` +
+                        locationOnly[2].toUpperCase();
                 }
             }
 
@@ -1493,9 +1557,10 @@ async function collectPostLinks(
                 url: href,
                 preview: preview.slice(0, 1_500),
 
-                // NEW — authoritative search-result metadata
+                // Authoritative metadata from the same search card
                 author: author || null,
                 location: location || null,
+                posted_at_text: postedAtText || null,
             });
 
             if (results.length >= maxResults) {
@@ -1917,6 +1982,8 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         state: cityState.state,
         lead_type: ["general_contracting"],
         search_term: searchTerm,
+        posted_at_text: post.posted_at_text || null,
+        posted_at: parseNextdoorPostTimestamp(post.posted_at_text),
     };
 }
 
@@ -1933,7 +2000,10 @@ async function insertUnfilteredGeneralContracting(record) {
             lead_type,
             timestamp
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7::text[], NOW())
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7::text[],
+            COALESCE($8::timestamp, NOW())
+        )
             ON CONFLICT (post_url) DO UPDATE SET
             author = COALESCE(
                                           EXCLUDED.author,
@@ -1983,6 +2053,7 @@ async function insertUnfilteredGeneralContracting(record) {
         Array.isArray(record.lead_type)
             ? record.lead_type
             : [record.lead_type],
+        record.posted_at || null,
     ]);
 
     const insertedId = rows[0]?.id || null;
