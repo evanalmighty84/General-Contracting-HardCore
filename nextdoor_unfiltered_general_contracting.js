@@ -1700,6 +1700,43 @@ function authorsCompatibleForDuplicate(left, right) {
     return a === b;
 }
 
+function isCrossTermDuplicate(seenDuringRun, item) {
+    const url = normalizePostUrl(item.url || item.post_url);
+    const description =
+        item.preview || item.text || item.description || "";
+
+    const priorItems = seenDuringRun.get(url) || [];
+
+    const duplicate = priorItems.some((prior) =>
+        authorsCompatibleForDuplicate(
+            prior.author,
+            item.author,
+        ) &&
+        descriptionsLookLikeSamePost(
+            prior.description,
+            description,
+        )
+    );
+
+    if (duplicate) {
+        return true;
+    }
+
+    if (priorItems.length > 0) {
+        console.warn(
+            `⚠️ Same-run reused/mismatched URL not treated as cross-term duplicate: ${url}`,
+        );
+    }
+
+    priorItems.push({
+        author: item.author || null,
+        description,
+    });
+
+    seenDuringRun.set(url, priorItems);
+    return false;
+}
+
 async function getExistingUrls(posts) {
     const urls = posts.map((post) => normalizePostUrl(post.url));
 
@@ -2961,12 +2998,11 @@ async function processSearchTerm({
     for (const post of allPosts) {
         const url = normalizePostUrl(post.url);
 
-        if (seenDuringRun.has(url)) {
+        if (isCrossTermDuplicate(seenDuringRun, post)) {
             crossTermUrls.add(url);
             continue;
         }
 
-        seenDuringRun.add(url);
         uniqueForThisRun.push(post);
     }
 
@@ -3364,7 +3400,7 @@ async function main() {
         await closeStaleContextPages(context, bootstrapPage);
         await parkBootstrapPage(bootstrapPage);
 
-        const seenDuringRun = new Set();
+        const seenDuringRun = new Map();
 
         for (
             let termIndex = 0;
