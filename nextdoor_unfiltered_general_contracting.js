@@ -3591,6 +3591,33 @@ async function main() {
             });
         }
 
+        // A Nextdoor throttle stops further searches, not downstream handling
+        // of records already committed during this run. Preserve the existing
+        // /run pipeline (pre-enrichment/Sonar, then FTN) on a partial run.
+        // Only execute here for throttling; normal completion triggers once above.
+        if (isNextdoorThrottleError(error) && totals.inserted > 0) {
+            console.log(
+                `🚀 Nextdoor throttled after ${totals.inserted} insert(s); ` +
+                "triggering downstream enrichment for saved records.",
+            );
+            try {
+                await triggerFtnEnrichment({
+                    totalInserted: totals.inserted,
+                    totalFailed: totals.failed,
+                    totalExistingSkipped: totals.existingSkipped,
+                    totalCrossTermSkipped: totals.crossTermSkipped,
+                });
+                console.log(
+                    "✅ Partial scrape: downstream enrichment request accepted.",
+                );
+            } catch (triggerError) {
+                console.error(
+                    "❌ Downstream enrichment trigger failed after throttle: " +
+                    getErrorMessage(triggerError),
+                );
+            }
+        }
+
         throw error;
     } finally {
         console.log("🧹 Closing scraper resources...");
