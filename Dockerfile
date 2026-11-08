@@ -1,6 +1,6 @@
 FROM node:20-bookworm-slim AS node-runtime
 
-FROM public.ecr.aws/d3n0b1o9/mlx-launcher:mlx-latest
+FROM public.ecr.aws/d3n0b1o9/mlx-launcher@sha256:396cdfe9803e2d7c569c6682617813626df461361fea9d56b5c0c0898e067d8e
 
 USER root
 
